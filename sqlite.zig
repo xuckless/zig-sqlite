@@ -339,6 +339,13 @@ pub const Db = struct {
         var dummy_diags = Diagnostics{};
         var diags = options.diags orelse &dummy_diags;
 
+        // A no-op after the first call; needed when SQLite is built with SQLITE_OMIT_AUTOINIT.
+        const init_result = c.sqlite3_initialize();
+        if (init_result != c.SQLITE_OK) {
+            diags.err = getDetailedErrorFromResultCode(init_result);
+            return errors.errorFromResultCode(init_result);
+        }
+
         // Validate the threading mode
         if (options.threading_mode != .SingleThread and !isThreadSafe()) {
             return error.SQLiteBuildNotThreadSafe;
