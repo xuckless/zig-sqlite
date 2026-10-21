@@ -3,6 +3,7 @@ const debug = std.debug;
 const heap = std.heap;
 const mem = std.mem;
 const ResolvedTarget = std.Build.ResolvedTarget;
+const LazyPath = std.Build.LazyPath;
 const Query = std.Target.Query;
 const builtin = @import("builtin");
 const Translator = @import("translate_c").Translator;
@@ -107,43 +108,60 @@ fn computeTestTargets(isNative: bool, ci: ?bool) ?[]const TestTarget {
     return null;
 }
 
-/// Translates `header` (which includes sqlite3.h) with the translate-c package,
-/// which replaces `@cImport` and the deprecated `std.Build.addTranslateC`.
-fn translateSQLite(b: *std.Build, dep: *std.Build.Dependency, header: []const u8, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
-    const translate_c = b.dependency("translate_c", .{});
-    const t: Translator = .init(translate_c, .{
-        .c_source_file = b.path(header),
+/// The name of the `sqlite_config` header in `config_dir`.
+const config_header = "zig_sqlite_config.h";
+
+/// The C API, translated with the translate-c package from sqlite3.h in
+/// `include` and c/workaround.h. With a `config_dir`, its config header is
+/// included first, so the bindings see the compile-time options the library
+/// was built with (SQLITE_OMIT_DEPRECATED, for one, removes declarations).
+fn translateSQLite(b: *std.Build, include: LazyPath, config_dir: ?LazyPath, target: ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
+    const header = b.addWriteFiles().add("sqlite3_c.h", if (config_dir != null)
+        "#include \"" ++ config_header ++ "\"\n#include \"sqlite3.h\"\n#include \"workaround.h\"\n"
+    else
+        "#include \"sqlite3.h\"\n#include \"workaround.h\"\n");
+
+    const t: Translator = .init(b.dependency("translate_c", .{}), .{
+        .name = "sqlite3_c",
+        .c_source_file = header,
         .target = target,
         .optimize = optimize,
         // Struct fields default to zero, as with @cImport, so struct literals such as
         // vtab.zig's sqlite3_module compile against every SQLite version.
         .default_init = true,
     });
-    t.addIncludePath(dep.path("."));
+    if (config_dir) |dir| t.addIncludePath(dir);
+    t.addIncludePath(include);
     t.addIncludePath(b.path("c"));
 
     return t.mod;
 }
 
-// This creates a SQLite static library from the SQLite dependency code.
-fn makeSQLiteLib(b: *std.Build, dep: *std.Build.Dependency, c_flags: []const []const u8, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, sqlite_c: enum { with, without }) *std.Build.Step.Compile {
-    const mod = b.createModule(.{
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
+/// A static library with c/workaround.c, plus SQLite itself when `sqlite_src`
+/// (the amalgamation's directory) is given, built with the config header in
+/// `config_dir` as its SQLITE_CUSTOM_INCLUDE.
+fn makeSQLiteLib(b: *std.Build, sqlite_src: ?LazyPath, config_dir: ?LazyPath, c_flags: []const []const u8, target: ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Step.Compile {
     const lib = b.addLibrary(.{
-        .name = "sqlite",
+        .name = if (sqlite_src != null) "sqlite" else "zig-sqlite-workaround",
         .linkage = .static,
-        .root_module = mod,
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
     });
 
-    lib.root_module.addIncludePath(dep.path("."));
     lib.root_module.addIncludePath(b.path("c"));
-    if (sqlite_c == .with) {
+    if (sqlite_src) |src| {
+        lib.root_module.addIncludePath(src);
+        var src_flags: []const []const u8 = c_flags;
+        if (config_dir) |dir| {
+            lib.root_module.addIncludePath(dir);
+            src_flags = std.mem.concat(b.allocator, []const u8, &.{ c_flags, &.{"-DSQLITE_CUSTOM_INCLUDE=" ++ config_header} }) catch @panic("OOM");
+        }
         lib.root_module.addCSourceFile(.{
-            .file = dep.path("sqlite3.c"),
-            .flags = c_flags,
+            .file = src.path(b, "sqlite3.c"),
+            .flags = src_flags,
         });
     }
     lib.root_module.addCSourceFile(.{
@@ -154,20 +172,36 @@ fn makeSQLiteLib(b: *std.Build, dep: *std.Build.Dependency, c_flags: []const []c
     return lib;
 }
 
+/// Gives `mod` (rooted at sqlite.zig) its C API: the `sqlite3_c` import and
+/// the library with SQLite (or, for a caller's SQLite, only c/workaround.c).
+fn addCApi(b: *std.Build, mod: *std.Build.Module, include: LazyPath, config_dir: ?LazyPath, lib: *std.Build.Step.Compile, target: ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
+    mod.addImport("sqlite3_c", translateSQLite(b, include, config_dir, target, optimize));
+    mod.linkLibrary(lib);
+}
+
 pub fn build(b: *std.Build) !void {
     const in_memory = b.option(bool, "in_memory", "Should the tests run with sqlite in memory (default true)") orelse true;
     const dbfile = b.option([]const u8, "dbfile", "Always use this database file instead of a temporary one");
     const ci = b.option(bool, "ci", "Build and test in the CI on GitHub");
 
+    // SQLite from the caller. With `sqlite_include`, this package fetches and
+    // compiles no SQLite: the `sqlite` module gets bindings of the caller's
+    // sqlite3.h, and the caller links its own SQLite library to it
+    // (`dep.module("sqlite").linkLibrary(lib)`).
+    const sqlite_include = b.option(LazyPath, "sqlite_include", "Directory with the sqlite3.h of a SQLite the caller compiles and links itself");
+    // A header with SQLite's compile-time options (#define SQLITE_...): it is
+    // included before sqlite3.h in the bindings and, with the bundled SQLite,
+    // compiled in as SQLITE_CUSTOM_INCLUDE.
+    const sqlite_config = b.option(LazyPath, "sqlite_config", "Header with SQLite's compile-time options, for the bindings and the bundled SQLite");
+    const config_dir: ?LazyPath = if (sqlite_config) |path| blk: {
+        const wf = b.addWriteFiles();
+        _ = wf.addCopyFile(path, config_header);
+        break :blk wf.getDirectory();
+    } else null;
+
     const query = b.standardTargetOptionsQueryOnly(.{});
     const target = b.resolveTargetQuery(query);
     const optimize = b.standardOptimizeOption(.{});
-
-    // Upstream dependency
-    const sqlite_dep = b.dependency("sqlite", .{
-        .target = target,
-        .optimize = optimize,
-    });
 
     // Define C flags to use
 
@@ -229,39 +263,34 @@ pub fn build(b: *std.Build) !void {
     const c_flags = flags.items;
 
     //
-    // Main library and module
+    // Main module, on the caller's SQLite
     //
 
-    // const sqlite_lib, const sqlite_mod = blk: {
-    const sqlite_lib, _ = blk: {
-        const lib = makeSQLiteLib(b, sqlite_dep, c_flags, target, optimize, .with);
-
+    if (sqlite_include) |include| {
         const mod = b.addModule("sqlite", .{
             .root_source_file = b.path("sqlite.zig"),
             .link_libc = true,
         });
-        mod.addIncludePath(b.path("c"));
-        mod.addIncludePath(sqlite_dep.path("."));
-        mod.addImport("sqlite3_c", translateSQLite(b, sqlite_dep, "c/sqlite3_c.h", target, optimize));
-        mod.linkLibrary(lib);
+        addCApi(b, mod, include, config_dir, makeSQLiteLib(b, null, null, c_flags, target, optimize), target, optimize);
+        return;
+    }
 
-        break :blk .{ lib, mod };
-    };
-    b.installArtifact(sqlite_lib);
+    //
+    // Main library and module, on the bundled SQLite (a lazy dependency)
+    //
 
-    _ = blk: {
-        const lib = makeSQLiteLib(b, sqlite_dep, c_flags, target, optimize, .without);
+    const sqlite_dep = b.lazyDependency("sqlite", .{}) orelse return;
+    const sqlite_src = sqlite_dep.path(".");
 
-        const mod = b.addModule("sqliteext", .{
+    const sqlite_lib = makeSQLiteLib(b, sqlite_src, config_dir, c_flags, target, optimize);
+    {
+        const mod = b.addModule("sqlite", .{
             .root_source_file = b.path("sqlite.zig"),
             .link_libc = true,
         });
-        mod.addIncludePath(b.path("c"));
-        mod.addImport("sqlite3_ext_c", translateSQLite(b, sqlite_dep, "c/loadable_ext_c.h", target, optimize));
-        mod.linkLibrary(lib);
-
-        break :blk mod;
-    };
+        addCApi(b, mod, sqlite_src, config_dir, sqlite_lib, target, optimize);
+    }
+    b.installArtifact(sqlite_lib);
 
     //
     // Tests
@@ -286,7 +315,7 @@ pub fn build(b: *std.Build) !void {
             single_threaded_txt,
         });
 
-        const test_sqlite_lib = makeSQLiteLib(b, sqlite_dep, c_flags, cross_target, optimize, .with);
+        const test_sqlite_lib = makeSQLiteLib(b, sqlite_src, config_dir, c_flags, cross_target, optimize);
 
         const mod = b.createModule(.{
             .target = cross_target,
@@ -294,15 +323,12 @@ pub fn build(b: *std.Build) !void {
             .root_source_file = b.path("sqlite.zig"),
             .single_threaded = test_target.single_threaded,
         });
+        addCApi(b, mod, sqlite_src, config_dir, test_sqlite_lib, cross_target, optimize);
 
         const tests = b.addTest(.{
             .name = test_name,
             .root_module = mod,
         });
-        tests.root_module.addIncludePath(b.path("c"));
-        tests.root_module.addIncludePath(sqlite_dep.path("."));
-        tests.root_module.addImport("sqlite3_c", translateSQLite(b, sqlite_dep, "c/sqlite3_c.h", cross_target, optimize));
-        tests.root_module.linkLibrary(test_sqlite_lib);
 
         const tests_options = b.addOptions();
         tests.root_module.addImport("build_options", tests_options.createModule());
@@ -313,84 +339,6 @@ pub fn build(b: *std.Build) !void {
         const run_tests = b.addRunArtifact(tests);
         test_step.dependOn(&run_tests.step);
     }
-
-    // This builds an example shared library with the extension and a binary that tests it.
-
-    //\ const zigcrypto_install_artifact = addZigcrypto(b, sqliteext_mod, target, optimize);
-    //\ test_step.dependOn(&zigcrypto_install_artifact.step);
-    //\ const zigcrypto_test_run = addZigcryptoTestRun(b, sqlite_mod, target, optimize);
-    //\ zigcrypto_test_run.step.dependOn(&zigcrypto_install_artifact.step);
-    //\ test_step.dependOn(&zigcrypto_test_run.step);
-
-    //
-    // Tools
-    //
-
-    addPreprocessStep(b, sqlite_dep);
-}
-
-fn addPreprocessStep(b: *std.Build, sqlite_dep: *std.Build.Dependency) void {
-    const exe = b.addExecutable(.{
-        .name = "preprocess",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("build/Preprocessor.zig"),
-            .target = b.graph.host,
-        }),
-    });
-
-    const run = b.addRunArtifact(exe);
-    run.addFileArg(sqlite_dep.path("sqlite3.h"));
-    run.addFileArg(sqlite_dep.path("sqlite3ext.h"));
-    const loadable_sqlite3_h = run.addOutputFileArg2("loadable-ext-sqlite3.h", .{});
-    const loadable_sqlite3ext_h = run.addOutputFileArg2("loadable-ext-sqlite3ext.h", .{});
-
-    const w = b.addUpdateSourceFiles();
-    w.addCopyFileToSource(loadable_sqlite3_h, "c/loadable-ext-sqlite3.h");
-    w.addCopyFileToSource(loadable_sqlite3ext_h, "c/loadable-ext-sqlite3ext.h");
-
-    const preprocess_headers = b.step("preprocess-headers", "Preprocess the headers for the loadable extensions");
-    preprocess_headers.dependOn(&w.step);
-}
-
-fn addZigcrypto(b: *std.Build, sqlite_mod: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Step.InstallArtifact {
-    const mod = b.createModule(.{
-        .root_source_file = b.path("examples/zigcrypto.zig"),
-        .target = getTarget(target),
-        .optimize = optimize,
-    });
-    const exe = b.addLibrary(.{
-        .name = "zigcrypto",
-        .root_module = mod,
-        .version = null,
-        .linkage = .dynamic,
-    });
-    exe.root_module.addImport("sqlite", sqlite_mod);
-
-    const install_artifact = b.addInstallArtifact(exe, .{});
-    install_artifact.step.dependOn(&exe.step);
-
-    return install_artifact;
-}
-
-fn addZigcryptoTestRun(b: *std.Build, sqlite_mod: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Step.Run {
-    const mod = b.createModule(.{
-        .root_source_file = b.path("examples/zigcrypto_test.zig"),
-        .target = getTarget(target),
-        .optimize = optimize,
-    });
-    const zigcrypto_test = b.addExecutable(.{
-        .name = "zigcrypto-test",
-        .root_module = mod,
-    });
-    zigcrypto_test.root_module.addImport("sqlite", sqlite_mod);
-
-    const install = b.addInstallArtifact(zigcrypto_test, .{});
-    install.step.dependOn(&zigcrypto_test.step);
-
-    const run = b.addRunArtifact(zigcrypto_test);
-    run.step.dependOn(&zigcrypto_test.step);
-
-    return run;
 }
 
 // See https://www.sqlite.org/compile.html for flags

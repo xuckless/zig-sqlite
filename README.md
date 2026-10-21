@@ -1,5 +1,18 @@
 # zig-sqlite
 
+> **Fork note (xuckless/zig-sqlite, branch `anole`).** This branch is the copy
+> [Anole](https://github.com/xuckless/anole) pins: upstream's Zig 0.17 port
+> (vrischmann/zig-sqlite PR #215), bindings through the
+> [translate-c package](https://codeberg.org/ziglang/translate-c) (branch
+> `zig-0.17.x`), the bundled SQLite (3.54.1) as a lazy dependency, the build
+> options `sqlite_include` (use the caller's SQLite: nothing is fetched or
+> compiled, the caller links its library to the `sqlite` module) and
+> `sqlite_config` (a header of `#define SQLITE_...` options, read by the
+> bindings and compiled into the bundled SQLite as `SQLITE_CUSTOM_INCLUDE`),
+> `sqlite3_initialize()` in `Db.init` (so `SQLITE_OMIT_AUTOINIT` builds work),
+> and no loadable-extension support (it has not built since Zig removed
+> `usingnamespace`).
+
 This package is a thin wrapper around [sqlite](https://sqlite.org/index.html)'s C API.
 
 _Maintainer note_: I'm currently on a break working with Zig and don't intend to work on new features for zig-sqlite.
